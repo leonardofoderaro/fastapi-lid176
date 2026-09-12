@@ -6,10 +6,10 @@ The service accepts an array of documents, including deeply nested objects and a
 
 ## Quick start
 
-The following commands create the Conda environment, install the Python dependencies, download the model and start the API:
+The following commands create a lightweight Conda environment, install the Python dependencies, download the model and start the API. This path usually resolves faster than creating the environment from `environment.yml`:
 
 ```bash
-conda env create -f environment.yml
+conda create -n lid176 python=3.12 pip -y
 conda activate lid176
 python -m pip install -r requirements.txt
 mkdir -p models
