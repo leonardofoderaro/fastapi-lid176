@@ -2,7 +2,7 @@
 
 A small FastAPI REST service and Python command-line interface for automatic language identification in JSON documents. It uses Facebook/Meta's multilingual `lid.176` model through `fastText`.
 
-The service accepts an array of documents, including deeply nested objects and arrays. By default, it returns one dominant language for each document.
+The service accepts an array of documents, including deeply nested objects and arrays. By default, it preserves each document structure and applies that document's dominant language to eligible text leaves.
 
 ## Quick start
 
@@ -65,7 +65,7 @@ Interactive documentation: <http://localhost:9292/docs>
 - Support for the language labels provided by the model, up to 176 labels.
 - Input made of an array of JSON documents.
 - Recursive processing of nested objects and arrays.
-- `dominant` mode by default: one language per document.
+- `dominant` mode by default: one document-level language applied to eligible text leaves.
 - Optional `fields` mode: independent predictions for every text field.
 - `top_k=1` by default; configurable up to `176`.
 - Request and configuration validation with Pydantic.
@@ -248,40 +248,59 @@ When the extended request format is used, the `documents` wrapper is preserved i
 
 ### `dominant` (default)
 
-This is the default mode. It returns one object for each document:
+This is the default mode. It returns the same document structure as the input. Eligible text leaves are replaced with a single-item prediction array containing the document's dominant language and probability.
+
+Fields are excluded from both analysis and transformation when one of these rules applies:
+
+- the key is exactly `id` (case-insensitive);
+- the key contains `date` (case-insensitive), for example `creation_date` or `updatedDate`;
+- the value is a JSON number, including integers, negative numbers and floating-point values.
+
+Excluded fields are copied exactly as received. Example:
 
 ```json
 {
-  "language": "it",
-  "probability": 0.98
+  "id": 15,
+  "name": "documento di prova",
+  "creation_date": "2026/09/12",
+  "score": -12.5
+}
+```
+
+Possible response shape:
+
+```json
+{
+  "id": 15,
+  "name": [
+    {"language": "it", "probability": 0.98}
+  ],
+  "creation_date": "2026/09/12",
+  "score": -12.5
 }
 ```
 
 The aggregation algorithm works as follows:
 
-1. collect every non-empty string, including nested strings;
-2. normalize whitespace and calculate each field's character length;
-3. request up to `top_k` predictions for every field;
-4. for each language, sum `probability * field_length`;
-5. divide the sum by the total length of all non-empty text fields;
-6. return the language with the highest weighted average.
+1. recursively collect every eligible, non-empty string, including nested strings;
+2. skip fields named `id`, fields containing `date` and all numeric values;
+3. normalize whitespace and calculate each eligible field's character length;
+4. request up to `top_k` predictions for every eligible field;
+5. for each language, sum `probability * field_length`;
+6. divide the sum by the total length of all eligible text fields;
+7. use the language with the highest weighted average to rebuild every eligible text leaf.
 
-Text length is therefore the field weight: a short tag has less influence than a long description. If a language does not occur in a field's top-k predictions, it contributes zero for that field.
+Text length is therefore the field weight: a short tag has less influence than a long description. If a language does not occur in a field's top-k predictions, it contributes zero for that field. The dominant prediction is calculated once per document and reused while the output structure is rebuilt.
 
-If the document has an `id` key directly at its top level, it is treated as metadata rather than text. The identifier is preserved in the dominant response:
-
-```json
-[
-  {"id": 42, "language": "it", "probability": 0.97}
-]
-```
-
-A document without non-empty string fields produces:
+If a document has no eligible non-empty string fields, protected values are still preserved and other unsupported scalar leaves become empty arrays, for example:
 
 ```json
-[
-  {"language": null, "probability": 0.0}
-]
+{
+  "id": 15,
+  "creation_date": "2026/09/12",
+  "score": -12.5,
+  "language": []
+}
 ```
 
 The default `top_k` is `1`. It can be increased when several model predictions should contribute to the aggregation:
@@ -337,8 +356,10 @@ Response:
 In this mode:
 
 - dictionary keys, object nesting and array positions are preserved;
-- every string becomes an array of `{language, probability}` objects;
-- empty strings and non-string values become `[]`;
+- fields named `id` or containing `date` are copied exactly;
+- numeric values, including negative and floating-point values, are copied exactly;
+- every other string becomes an array of `{language, probability}` objects;
+- empty strings, booleans and null values become `[]`;
 - `top_k=1` remains the default unless explicitly overridden.
 
 ## Swagger UI and OpenAPI

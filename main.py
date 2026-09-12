@@ -290,12 +290,45 @@ def detect_language(
     ]
 
 
+def is_excluded_field(field_name: str) -> bool:
+    """Return whether a field name must bypass language identification.
+
+    Args:
+        field_name: JSON object key to inspect.
+
+    Returns:
+        ``True`` when the key is exactly ``id`` or contains ``date``, using a
+        case-insensitive comparison; otherwise ``False``.
+
+    The rule is applied at every nesting level. For example, both ``id`` and
+    ``author_id`` are handled according to the exact-name rule only for the
+    former, while ``creation_date`` and ``updatedDate`` match the date rule.
+    """
+    normalized_name = field_name.casefold()
+    return normalized_name == "id" or "date" in normalized_name
+
+
+def is_json_number(value: Any) -> bool:
+    """Return whether a value is a JSON number rather than a boolean.
+
+    Args:
+        value: Value from a decoded JSON document.
+
+    Returns:
+        ``True`` for integers and floating-point values, including negative and
+        fractional values. Booleans are explicitly excluded because Python's
+        ``bool`` type is a subclass of ``int`` even though JSON treats booleans
+        and numbers as different types.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def transform_leaf_values(
     value: Any,
     top_k: int,
     model_path: Path | None = None,
 ) -> Any:
-    """Recursively replace JSON leaves with field-level predictions.
+    """Recursively produce the detailed field-level representation.
 
     Args:
         value: Current JSON node being visited.
@@ -304,24 +337,36 @@ def transform_leaf_values(
 
     Returns:
         A JSON-compatible value with the same dictionary keys and list layout.
-        String leaves become prediction arrays; non-string leaves and empty
-        strings become empty arrays.
+        Fields named ``id`` or containing ``date`` are returned unchanged.
+        Numeric values are also returned unchanged. Other string leaves become
+        prediction arrays; empty strings and remaining non-string leaves become
+        empty arrays.
     """
     if isinstance(value, dict):
-        return {
-            key: transform_leaf_values(child, top_k, model_path)
-            for key, child in value.items()
-        }
+        transformed: dict[str, Any] = {}
+        for key, child in value.items():
+            # Metadata fields are copied as a whole. This is important for a
+            # date field whose value is a string: the date must never reach the
+            # language model merely because it happens to be textual.
+            if is_excluded_field(str(key)):
+                transformed[key] = child
+            else:
+                transformed[key] = transform_leaf_values(child, top_k, model_path)
+        return transformed
 
     if isinstance(value, list):
         return [transform_leaf_values(item, top_k, model_path) for item in value]
 
+    if is_json_number(value):
+        # Keep the original Python number so JSON serialization reproduces its
+        # value instead of replacing it with an empty prediction array.
+        return value
+
     if isinstance(value, str):
         return detect_language(value, top_k, model_path)
 
-    # Numbers, booleans and null are valid JSON but are not language-bearing
-    # text. The detailed mode represents them with the same empty result used
-    # for empty strings.
+    # Booleans and null are valid JSON values, but are neither text nor the
+    # explicitly protected numeric values covered above.
     return []
 
 
@@ -329,48 +374,47 @@ def collect_weighted_predictions(
     value: Any,
     top_k: int,
     model_path: Path | None = None,
-    is_document_root: bool = False,
 ) -> WeightedPredictions:
-    """Collect predictions and normalized character weights recursively.
+    """Collect model predictions and text weights from analyzable leaves.
 
     Args:
         value: Current JSON node.
         top_k: Maximum predictions requested per non-empty string.
         model_path: Optional explicit model path.
-        is_document_root: Whether ``value`` is the root document. Only at the
-            root is a key named ``id`` treated as metadata instead of text.
 
     Returns:
-        A list of ``(predictions, weight)`` pairs, one pair for each non-empty
-        string leaf. The weight is the number of characters after whitespace
-        normalization.
+        A flat list of ``(predictions, weight)`` pairs, one pair for each
+        non-empty string that is eligible for analysis. Metadata fields named
+        ``id`` or containing ``date`` and every numeric value are excluded.
+        Each weight is the number of characters after whitespace normalization.
 
-    The function deliberately returns a flat list. Flattening the leaves makes
-    the aggregation formula independent from the original nesting depth while
-    leaving the original document untouched.
+    Flattening leaves makes the aggregation formula independent of nesting
+    depth while leaving the original document untouched.
     """
     if isinstance(value, dict):
-        return [
-            item
-            for key, child in value.items()
-            if not (is_document_root and key == "id")
-            for item in collect_weighted_predictions(child, top_k, model_path)
-        ]
+        collected: WeightedPredictions = []
+        for key, child in value.items():
+            # Excluded fields are skipped before recursion, so a nested date
+            # object or an id string can never accidentally be analyzed.
+            if is_excluded_field(str(key)):
+                continue
+            collected.extend(collect_weighted_predictions(child, top_k, model_path))
+        return collected
 
     if isinstance(value, list):
-        return [
-            item
-            for child in value
-            for item in collect_weighted_predictions(child, top_k, model_path)
-        ]
+        collected = []
+        for child in value:
+            collected.extend(collect_weighted_predictions(child, top_k, model_path))
+        return collected
 
     if isinstance(value, str):
         cleaned_text = " ".join(value.split())
         if cleaned_text:
-            # The same normalized text determines both the model input and
-            # the field's influence on the document-level average.
+            # The normalized text determines both the model input and this
+            # field's influence on the document-level weighted average.
             return [(detect_language(cleaned_text, top_k, model_path), len(cleaned_text))]
 
+    # Numbers, booleans and null do not contain language-bearing text.
     return []
 
 
@@ -379,35 +423,30 @@ def detect_dominant_language(
     top_k: int,
     model_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Return the dominant language for one JSON document.
+    """Calculate the dominant language without analyzing protected fields.
 
     Args:
         document: Arbitrary JSON-compatible document.
-        top_k: Maximum predictions considered for each text field.
+        top_k: Maximum predictions considered for each eligible text field.
         model_path: Optional explicit model path.
 
     Returns:
         A dictionary with ``language`` and weighted ``probability``. If the
-        document has a top-level ``id``, the same identifier is included in the
-        result. Documents without non-empty string fields return
+        document has a top-level ``id``, the identifier is included unchanged.
+        Documents without eligible non-empty string fields return
         ``{"language": None, "probability": 0.0}``.
 
-    The document score for a language is calculated as follows::
+    The score is calculated as::
 
         score(language) = sum(probability * field_length) / total_text_length
 
     A language absent from a field's top-k predictions contributes zero for
-    that field. Weighting by normalized character count prevents a very short
-    tag from having the same influence as a long description.
+    that field. Fields named ``id`` or containing ``date`` and all numeric
+    values are excluded before this calculation begins.
     """
     has_document_id = isinstance(document, dict) and "id" in document
     document_id = document.get("id") if has_document_id else None
-    predictions_with_weights = collect_weighted_predictions(
-        document,
-        top_k,
-        model_path,
-        is_document_root=True,
-    )
+    predictions_with_weights = collect_weighted_predictions(document, top_k, model_path)
 
     if not predictions_with_weights:
         result: dict[str, Any] = {"language": None, "probability": 0.0}
@@ -416,9 +455,8 @@ def detect_dominant_language(
     weighted_probability_sums: dict[str, float] = {}
     total_weight = 0
 
-    # Every field contributes its probability multiplied by its text length.
-    # Languages not returned by fastText for a field are intentionally absent
-    # from that field's loop and therefore contribute zero.
+    # Each eligible field contributes probability multiplied by text length.
+    # A language missing from a field's predictions therefore contributes zero.
     for field_predictions, weight in predictions_with_weights:
         total_weight += weight
         for prediction in field_predictions:
@@ -438,6 +476,66 @@ def detect_dominant_language(
     }
     return {"id": document_id, **result} if has_document_id else result
 
+
+def transform_dominant_document(
+    document: Any,
+    top_k: int,
+    model_path: Path | None = None,
+) -> Any:
+    """Return a document-shaped result using its single dominant prediction.
+
+    Args:
+        document: Arbitrary JSON-compatible document.
+        top_k: Maximum predictions considered while finding the dominant
+            language.
+        model_path: Optional explicit model path.
+
+    Returns:
+        The same object/list structure as ``document``. Protected fields
+        (``id``, names containing ``date`` and numeric values) are copied
+        exactly. Every eligible non-empty string is replaced with a one-item
+        prediction array containing the document's dominant language and
+        probability. Empty strings and unsupported scalar values become ``[]``.
+
+    The dominant language is calculated once for the whole document and then
+    reused for all eligible text leaves. This both matches the document-level
+    contract and avoids running the model a second time for each field during
+    reconstruction.
+    """
+    dominant = detect_dominant_language(document, top_k, model_path)
+    if dominant["language"] is None:
+        dominant_prediction: Prediction | None = None
+    else:
+        dominant_prediction = {
+            "language": str(dominant["language"]),
+            "probability": float(dominant["probability"]),
+        }
+
+    def rebuild(value: Any) -> Any:
+        """Rebuild one node while applying the document-level result."""
+        if isinstance(value, dict):
+            rebuilt: dict[str, Any] = {}
+            for key, child in value.items():
+                if is_excluded_field(str(key)):
+                    rebuilt[key] = child
+                else:
+                    rebuilt[key] = rebuild(child)
+            return rebuilt
+
+        if isinstance(value, list):
+            return [rebuild(item) for item in value]
+
+        if is_json_number(value):
+            return value
+
+        if isinstance(value, str):
+            if not value.strip() or dominant_prediction is None:
+                return []
+            return [dominant_prediction.copy()]
+
+        return []
+
+    return rebuild(document)
 
 def parse_detection_payload(payload: Any) -> tuple[DetectionRequest, bool]:
     """Normalize the two supported request shapes.
@@ -522,7 +620,9 @@ def detect(payload: Any = Body(...)) -> Any:
 
     Returns:
         A plain result array for plain-array input, or a ``documents`` wrapper
-        for extended input.
+        for extended input. In ``dominant`` mode each result keeps the input
+        document structure while replacing eligible text leaves with the
+        document-level dominant prediction.
 
     Raises:
         HTTPException: ``422`` for invalid payloads and ``500`` when the model
@@ -537,7 +637,7 @@ def detect(payload: Any = Body(...)) -> Any:
             ]
         else:
             documents = [
-                detect_dominant_language(document, request.top_k)
+                transform_dominant_document(document, request.top_k)
                 for document in request.documents
             ]
     except InvalidPayloadError as exc:
@@ -674,7 +774,7 @@ class LidCli:
             ]
         else:
             documents = [
-                detect_dominant_language(
+                transform_dominant_document(
                     document,
                     effective_top_k,
                     selected_model_path,
