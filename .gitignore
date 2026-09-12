@@ -6,6 +6,8 @@ __pycache__/
 # C extensions
 *.so
 
+*.ftz
+
 # Distribution / packaging
 .Python
 build/
